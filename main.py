@@ -15,6 +15,7 @@ Author: Abdul Kadir
 import io
 import json
 import os
+import time
 from contextlib import asynccontextmanager
 from typing import Optional
 
@@ -283,15 +284,19 @@ class StudentEmbedding(BaseModel):
 
 class RegisterResponse(BaseModel):
     """Response for /register endpoint."""
-    embedding: list[float] = Field(..., description="512-dimensional face embedding")
-    face_count: int = Field(..., description="Number of faces detected (should be 1)")
+    status: str
+    message: str
+    total_time_seconds: float = Field(..., description="Total request processing time")
+    per_image_times: dict[str, float] = Field(..., description="Processing time per filename")
 
 
 class DetectResponse(BaseModel):
-    """Response for /detect endpoint."""
+    """Response for /process-attendance endpoint."""
     matched_student_ids: list[str] = Field(..., description="List of matched student IDs")
-    total_faces_detected: int = Field(..., description="Total faces found in classroom photo")
+    total_faces_detected: int = Field(..., description="Total UNIQUE faces found")
     similarity_threshold: float = Field(..., description="Threshold used for matching")
+    total_time_seconds: float = Field(..., description="Total request processing time")
+    per_image_times: dict[str, float] = Field(..., description="Processing time per filename")
 
 
 # ============================================================================
@@ -316,67 +321,127 @@ def save_local_db(data):
 @app.post("/register", response_model=RegisterResponse)
 async def register_student(
     student_id: str = Form(...), 
-    file: UploadFile = File(...)
+    files: list[UploadFile] = File(...)
 ):
-    """Extracts embedding and saves it directly to local_db.json."""
-    logger.info(f"Processing /register request for: {student_id}")
+    """Overwrites old embeddings and registers up to 3 new angles with time profiling."""
+    request_start_time = time.perf_counter()  # START MASTER TIMER
     
-    image_bytes = await file.read()
-    image = decode_image(image_bytes)
-    image = downscale_image(image, Config.MAX_IMAGE_WIDTH)
+    if len(files) > 3:
+        raise HTTPException(status_code=400, detail="Maximum of 3 images allowed per registration.")
+        
+    logger.info(f"Processing overwrite /register request for: {student_id}. Files: {len(files)}")
     
-    faces = face_app.get(image)
-    if len(faces) == 0:
-        raise HTTPException(status_code=400, detail="No face detected.")
-    
-    embedding = faces[0].embedding.tolist()
-    
-    # --- Local DB Save Logic ---
     db_data = load_local_db()
-    db_data.append({
-        "student_id": student_id,
-        "embedding": embedding
-    })
+    db_data = [record for record in db_data if record.get("student_id") != student_id]
+    
+    successful_embeddings = 0
+    per_image_times = {}
+    
+    for file in files:
+        img_start_time = time.perf_counter()  # START PER-IMAGE TIMER
+        
+        image_bytes = await file.read()
+        image = decode_image(image_bytes)
+        image = downscale_image(image, Config.MAX_IMAGE_WIDTH)
+        
+        faces = face_app.get(image)
+        
+        if len(faces) == 0:
+            logger.warning(f"No face detected in {file.filename}, skipping.")
+            per_image_times[file.filename] = round(time.perf_counter() - img_start_time, 3)
+            continue
+            
+        db_data.append({
+            "student_id": student_id,
+            "embedding": faces[0].embedding.tolist()
+        })
+        successful_embeddings += 1
+        
+        # END PER-IMAGE TIMER
+        per_image_times[file.filename] = round(time.perf_counter() - img_start_time, 3)
+
     save_local_db(db_data)
     
-    return RegisterResponse(embedding=embedding, face_count=len(faces))
+    if successful_embeddings == 0:
+        raise HTTPException(status_code=400, detail="No faces detected in any uploaded files. Registration failed.")
+    
+    request_end_time = time.perf_counter()  # END MASTER TIMER
+    total_time = round(request_end_time - request_start_time, 3)
+    
+    return RegisterResponse(
+        status="success",
+        message=f"Cleared old data. Successfully saved {successful_embeddings} new profiles for {student_id}.",
+        total_time_seconds=total_time,
+        per_image_times=per_image_times
+    )
 
 
 @app.post("/process-attendance", response_model=DetectResponse)
-async def detect_attendance(file: UploadFile = File(...)):
-    """Reads students from local_db.json and matches against the uploaded classroom photo."""
-    logger.info(f"Processing /process-attendance request")
+async def detect_attendance(files: list[UploadFile] = File(...)):
+    """Processes classroom photos, deduplicates faces, and profiles processing time."""
+    request_start_time = time.perf_counter()  # START MASTER TIMER
     
-    # --- Load from Local DB instead of form data ---
+    if len(files) > 3:
+        raise HTTPException(status_code=400, detail="Maximum of 3 classroom images allowed per request.")
+        
+    logger.info(f"Processing /process-attendance request with {len(files)} images.")
+    
     students_data = load_local_db()
     if not students_data:
         raise HTTPException(status_code=400, detail="Database is empty. Register students first.")
         
     students = [StudentEmbedding(**s) for s in students_data]
-    
-    image_bytes = await file.read()
-    image = decode_image(image_bytes)
-    image = downscale_image(image, Config.MAX_IMAGE_WIDTH)
-    
-    faces = face_app.get(image)
-    if len(faces) == 0:
-        return DetectResponse(matched_student_ids=[], total_faces_detected=0, similarity_threshold=Config.SIMILARITY_THRESHOLD)
-    
-    detected_embeddings = np.array([face.embedding for face in faces])
     gallery_embeddings = np.array([s.embedding for s in students])
     student_ids = [s.student_id for s in students]
     
+    unique_room_faces = []
+    per_image_times = {}
+    
+    for file in files:
+        img_start_time = time.perf_counter()  # START PER-IMAGE TIMER
+        
+        image_bytes = await file.read()
+        image = decode_image(image_bytes)
+        image = downscale_image(image, Config.MAX_IMAGE_WIDTH)
+        
+        faces = face_app.get(image)
+        
+        for face in faces:
+            emb = face.embedding
+            is_duplicate = False
+            
+            if len(unique_room_faces) > 0:
+                similarities = cosine_similarity_matrix(emb, np.array(unique_room_faces))
+                if np.max(similarities) >= 0.60: 
+                    is_duplicate = True
+            
+            if not is_duplicate:
+                unique_room_faces.append(emb)
+                
+        # END PER-IMAGE TIMER
+        per_image_times[file.filename] = round(time.perf_counter() - img_start_time, 3)
+
     matched_student_ids = set()
-    for i, detected_emb in enumerate(detected_embeddings):
-        similarities = cosine_similarity_matrix(detected_emb, gallery_embeddings)
-        best_match_idx = np.argmax(similarities)
-        if similarities[best_match_idx] >= Config.SIMILARITY_THRESHOLD:
-            matched_student_ids.add(student_ids[best_match_idx])
+    
+    if len(unique_room_faces) > 0:
+        unique_detected_embeddings = np.array(unique_room_faces)
+        
+        for detected_emb in unique_detected_embeddings:
+            similarities = cosine_similarity_matrix(detected_emb, gallery_embeddings)
+            best_match_idx = np.argmax(similarities)
+            
+            if similarities[best_match_idx] >= Config.SIMILARITY_THRESHOLD:
+                matched_student_ids.add(student_ids[best_match_idx])
+                
+    request_end_time = time.perf_counter()  # END MASTER TIMER
+    total_time = round(request_end_time - request_start_time, 3)
             
     return DetectResponse(
         matched_student_ids=list(matched_student_ids),
-        total_faces_detected=len(faces),
-        similarity_threshold=Config.SIMILARITY_THRESHOLD
+        total_faces_detected=len(unique_room_faces),
+        similarity_threshold=Config.SIMILARITY_THRESHOLD,
+        total_time_seconds=total_time,
+        per_image_times=per_image_times
     )
 
 
