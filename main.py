@@ -3,14 +3,13 @@
 MindZed Technologies - Classroom Attendance AI Microservice
 ===========================================================
 FastAPI service for face detection and recognition using InsightFace.
-Optimized for NVIDIA RTX 3050 (4GB VRAM) with strict memory management.
 
 Architecture:
   - Next.js PWA  <->  PostgreSQL (pgvector)  <->  THIS SERVICE
   - Endpoints: /register (single headshot -> embedding)
                /detect   (classroom photo -> matched student IDs)
 
-Author: MindZed Technologies AI Team
+Author: Abdul Kadir
 """
 
 import io
