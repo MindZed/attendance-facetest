@@ -68,7 +68,8 @@ class Config:
     
     # --- Server ---
     HOST: str = "0.0.0.0"
-    PORT: int = 8000  # Different from Next.js (3000) and Postgres (5432)
+    port_env = os.getenv("PORT", "8000")
+    PORT: int = int(port_env) # Different from Next.js (3000) and Postgres (5432)
 
 
 # ============================================================================
