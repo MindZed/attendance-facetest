@@ -15,12 +15,22 @@ Author: Abdul Kadir
 import io
 import json
 import os
-
-#Only for Windows, to avoid DLL load errors for CUDA (Sewen Laptop)
-os.add_dll_directory(r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.4\bin")
-
 from contextlib import asynccontextmanager
 from typing import Optional
+
+from dotenv import load_dotenv
+load_dotenv()
+
+# Only execute this block if the operating system is Windows ('nt')
+if os.name == 'nt':
+    cuda_path = os.getenv("CUDA_DLL_PATH")
+    if cuda_path and os.path.exists(cuda_path):
+        try:
+            os.add_dll_directory(cuda_path)
+            print(f"🔧 Windows CUDA DLL Path injected: {cuda_path}")
+        except Exception as e:
+            print(f"⚠️ Failed to add CUDA DLL directory: {e}")
+            #add the path to merged CUDA/cuDNN
 
 import cv2
 import numpy as np
@@ -31,8 +41,6 @@ from insightface.app import FaceAnalysis
 from loguru import logger
 from pydantic import BaseModel, Field
 
-from dotenv import load_dotenv
-load_dotenv()
 
 # ============================================================================
 # CONFIGURATION
