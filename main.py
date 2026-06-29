@@ -15,6 +15,10 @@ Author: Abdul Kadir
 import io
 import json
 import os
+
+#Only for Windows, to avoid DLL load errors for CUDA (Sewen Laptop)
+#os.add_dll_directory(r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.4\bin")
+
 from contextlib import asynccontextmanager
 from typing import Optional
 

@@ -35,7 +35,7 @@ def run_test():
     print(f"\nTotal embeddings loaded into temporary DB: {len(student_records)}")
 
     print("\n--- 2. Testing Group Photo ---")
-    group_photo_path = "group4.jpg"
+    group_photo_path = "group2.jpg"
     
     # Send the group photo AND all registered arrays to the AI
     with open(group_photo_path, "rb") as f:
