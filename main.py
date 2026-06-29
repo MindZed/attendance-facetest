@@ -17,7 +17,7 @@ import json
 import os
 
 #Only for Windows, to avoid DLL load errors for CUDA (Sewen Laptop)
-#os.add_dll_directory(r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.4\bin")
+os.add_dll_directory(r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.4\bin")
 
 from contextlib import asynccontextmanager
 from typing import Optional
@@ -30,6 +30,9 @@ from fastapi.responses import JSONResponse
 from insightface.app import FaceAnalysis
 from loguru import logger
 from pydantic import BaseModel, Field
+
+from dotenv import load_dotenv
+load_dotenv()
 
 # ============================================================================
 # CONFIGURATION
@@ -194,10 +197,17 @@ async def lifespan(app: FastAPI):
     available_providers = ort.get_available_providers()
     logger.info(f"Available ONNX Runtime providers: {available_providers}")
     
-    if "CUDAExecutionProvider" not in available_providers:
-        logger.warning("CUDAExecutionProvider not available! Falling back to CPU.")
+    # --- NEW TOGGLE LOGIC ---
+    target = os.getenv("AI_HARDWARE_TARGET", "gpu").lower()
+
+    if target == "cpu":
+        logger.info("💻 AI Core: Hardware target explicitly set to CPU in .env")
+        providers = ["CPUExecutionProvider"]
+    elif "CUDAExecutionProvider" not in available_providers:
+        logger.warning("⚠️ CUDA requested but not found! Falling back to CPU.")
         providers = ["CPUExecutionProvider"]
     else:
+        logger.info("🤖 AI Core: Target set to NVIDIA GPU")
         # Convert MB to Bytes for the ONNX config
         gpu_mem_limit_bytes = Config.GPU_MEMORY_LIMIT_MB * 1024 * 1024
         
@@ -276,174 +286,84 @@ class DetectResponse(BaseModel):
 
 
 # ============================================================================
+# TEMPORARY LOCAL DB HELPERS (For Postman Testing)
+# ============================================================================
+DB_FILE = "local_db.json"
+
+def load_local_db():
+    if os.path.exists(DB_FILE):
+        with open(DB_FILE, "r") as f:
+            return json.load(f)
+    return []
+
+def save_local_db(data):
+    with open(DB_FILE, "w") as f:
+        json.dump(data, f)
+
+# ============================================================================
 # ENDPOINTS
 # ============================================================================
 
-@app.get("/health")
-async def health_check():
-    """Health check endpoint for Docker/Kubernetes probes."""
-    return {
-        "status": "healthy",
-        "model_loaded": face_app is not None,
-        "gpu_memory_limit_mb": Config.GPU_MEMORY_LIMIT_MB
-    }
-
-
 @app.post("/register", response_model=RegisterResponse)
-async def register_student(file: UploadFile = File(...)):
-    """
-    Register a student by extracting face embedding from a headshot.
+async def register_student(
+    student_id: str = Form(...), 
+    file: UploadFile = File(...)
+):
+    """Extracts embedding and saves it directly to local_db.json."""
+    logger.info(f"Processing /register request for: {student_id}")
     
-    Workflow:
-    1. Receive uploaded image (single high-quality headshot)
-    2. Detect face (expect exactly 1 face)
-    3. Extract 512-dimensional embedding
-    4. Return embedding as JSON for Next.js to save to PostgreSQL
-    
-    Args:
-        file: Uploaded image file (JPEG/PNG)
-    
-    Returns:
-        RegisterResponse with embedding array
-    
-    Raises:
-        400: No face detected, or multiple faces detected
-    """
-    logger.info(f"Processing /register request: {file.filename}")
-    
-    # --- Read and decode image ---
     image_bytes = await file.read()
     image = decode_image(image_bytes)
-    
-    # --- Downscale if needed (headshots usually don't need this, but safety check) ---
     image = downscale_image(image, Config.MAX_IMAGE_WIDTH)
     
-    # --- Detect faces ---
     faces = face_app.get(image)
-    
     if len(faces) == 0:
-        raise HTTPException(
-            status_code=400,
-            detail="No face detected in the image. Please upload a clear headshot."
-        )
+        raise HTTPException(status_code=400, detail="No face detected.")
     
-    if len(faces) > 1:
-        logger.warning(f"Multiple faces detected ({len(faces)}). Using the largest face.")
-        # Select the face with the largest bounding box area
-        faces = sorted(faces, key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]), reverse=True)
+    embedding = faces[0].embedding.tolist()
     
-    # --- Extract embedding ---
-    # InsightFace returns embedding as numpy array (512,)
-    embedding = faces[0].embedding
+    # --- Local DB Save Logic ---
+    db_data = load_local_db()
+    db_data.append({
+        "student_id": student_id,
+        "embedding": embedding
+    })
+    save_local_db(db_data)
     
-    # Convert to list for JSON serialization
-    embedding_list = embedding.tolist()
-    
-    logger.info(f"Successfully extracted embedding for student. Shape: {embedding.shape}")
-    
-    return RegisterResponse(
-        embedding=embedding_list,
-        face_count=len(faces)
-    )
+    return RegisterResponse(embedding=embedding, face_count=len(faces))
 
 
 @app.post("/process-attendance", response_model=DetectResponse)
-async def detect_attendance(
-    file: UploadFile = File(...),
-    students_json: str = Form(...)
-):
-    """
-    Detect attendance from a classroom photo.
+async def detect_attendance(file: UploadFile = File(...)):
+    """Reads students from local_db.json and matches against the uploaded classroom photo."""
+    logger.info(f"Processing /process-attendance request")
     
-    Workflow:
-    1. Receive uploaded classroom photo + list of registered students (with embeddings)
-    2. Downscale image to prevent VRAM overflow
-    3. Detect all faces in the photo
-    4. Extract embeddings for each detected face
-    5. Compare against registered students using cosine similarity
-    6. Return list of matched student IDs
+    # --- Load from Local DB instead of form data ---
+    students_data = load_local_db()
+    if not students_data:
+        raise HTTPException(status_code=400, detail="Database is empty. Register students first.")
+        
+    students = [StudentEmbedding(**s) for s in students_data]
     
-    Args:
-        file: Uploaded classroom photo (wide-angle)
-        students_json: JSON string of student list, format:
-            [{"student_id": "S001", "embedding": [0.1, 0.2, ...]}, ...]
-    
-    Returns:
-        DetectResponse with matched student IDs
-    
-    Raises:
-        400: Invalid JSON, no faces detected, or no students provided
-    """
-    logger.info(f"Processing /detect request: {file.filename}")
-    
-    # --- Parse students JSON ---
-    try:
-        students_data = json.loads(students_json)
-        students = [StudentEmbedding(**s) for s in students_data]
-    except json.JSONDecodeError as e:
-        raise HTTPException(status_code=400, detail=f"Invalid JSON in students_json: {str(e)}")
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Error parsing students data: {str(e)}")
-    
-    if len(students) == 0:
-        raise HTTPException(status_code=400, detail="No students provided for matching")
-    
-    logger.info(f"Matching against {len(students)} registered students")
-    
-    # --- Read and decode image ---
     image_bytes = await file.read()
     image = decode_image(image_bytes)
-    
-    # --- CRITICAL: Downscale to prevent VRAM overflow ---
     image = downscale_image(image, Config.MAX_IMAGE_WIDTH)
     
-    # --- Detect all faces in classroom photo ---
     faces = face_app.get(image)
-    
     if len(faces) == 0:
-        logger.warning("No faces detected in classroom photo")
-        return DetectResponse(
-            matched_student_ids=[],
-            total_faces_detected=0,
-            similarity_threshold=Config.SIMILARITY_THRESHOLD
-        )
+        return DetectResponse(matched_student_ids=[], total_faces_detected=0, similarity_threshold=Config.SIMILARITY_THRESHOLD)
     
-    logger.info(f"Detected {len(faces)} faces in classroom photo")
-    
-    # --- Extract embeddings from all detected faces ---
-    detected_embeddings = np.array([face.embedding for face in faces])  # Shape: (N, 512)
-    
-    # --- Prepare gallery embeddings from registered students ---
-    gallery_embeddings = np.array([s.embedding for s in students])  # Shape: (M, 512)
+    detected_embeddings = np.array([face.embedding for face in faces])
+    gallery_embeddings = np.array([s.embedding for s in students])
     student_ids = [s.student_id for s in students]
     
-    # --- Match faces to students ---
-    matched_student_ids = set()  # Use set to avoid duplicates
-    
+    matched_student_ids = set()
     for i, detected_emb in enumerate(detected_embeddings):
-        # Compute cosine similarity between this face and all students
         similarities = cosine_similarity_matrix(detected_emb, gallery_embeddings)
-        
-        # Find the best match
         best_match_idx = np.argmax(similarities)
-        best_similarity = similarities[best_match_idx]
-        
-        # Check if similarity exceeds threshold
-        if best_similarity >= Config.SIMILARITY_THRESHOLD:
-            matched_id = student_ids[best_match_idx]
-            matched_student_ids.add(matched_id)
-            logger.debug(
-                f"Face {i+1} matched to {matched_id} "
-                f"(similarity: {best_similarity:.3f})"
-            )
-        else:
-            logger.debug(
-                f"Face {i+1} not matched "
-                f"(best similarity: {best_similarity:.3f} < {Config.SIMILARITY_THRESHOLD})"
-            )
-    
-    logger.info(f"Matched {len(matched_student_ids)} students out of {len(faces)} detected faces")
-    
+        if similarities[best_match_idx] >= Config.SIMILARITY_THRESHOLD:
+            matched_student_ids.add(student_ids[best_match_idx])
+            
     return DetectResponse(
         matched_student_ids=list(matched_student_ids),
         total_faces_detected=len(faces),

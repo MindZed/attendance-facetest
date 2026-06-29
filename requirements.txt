@@ -8,3 +8,4 @@ insightface
 pydantic
 requests
 loguru
+python-dotenv
